@@ -197,6 +197,42 @@ if getattr(gef.arch, "arch", "") == "RISCV":
     except Exception:
         pass
 
+    # GEF's backward walk tries `pc - 15*n ... pc - 1` without a lower bound.
+    # Near the start of flash that reaches negative addresses, and GDB raises
+    # "can't convert negative int to unsigned" (a gdb.error, not MemoryError),
+    # which aborts the whole `context` command. Clamp the search at 0.
+    def _safe_previous_instruction_address(addr, n):
+        if addr < 0 or n <= 0:
+            return None
+        if gef.arch.instruction_length:
+            return max(0, addr - n * gef.arch.instruction_length)
+
+        cur_insn_addr = _main.gef_current_instruction(addr).address
+        for i in range(15 * n, 0, -1):
+            start_addr = addr - i
+            if start_addr < 0:
+                continue
+            try:
+                insns = list(_main.gdb_disassemble(start_addr, end_pc=cur_insn_addr))
+            except (gdb.error, OverflowError):
+                break
+
+            if len(insns) < n + 1:
+                continue
+
+            insns = insns[-n - 1:]
+            if insns[-1].address != cur_insn_addr:
+                continue
+            if all(insn.is_valid() for insn in insns):
+                return insns[0].address
+
+        return None
+
+    try:
+        _main.gdb_get_nth_previous_instruction_address = _safe_previous_instruction_address
+    except Exception:
+        pass
+
 
 # --- registers: hex plus decimal -----------------------------------------
 
