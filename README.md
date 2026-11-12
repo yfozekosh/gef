@@ -126,6 +126,10 @@ loaded.
   Adjust the constants at the top of `gef_riscv.py` for another part.
 - GEF's Linux-userland commands (`vmmap`, `heap`, and similar) are not useful
   on a bare-metal target.
+- Source colours require Pygments in GDB's Python path. For the WCH toolchain
+  that means installing it under
+  `~/.local/opt/wch-toolchain/share/gdb/python`; reinstalling the toolchain
+  removes it. Without Pygments the source pane is still usable, just plain.
 - Tested with WCH GDB 17.1 (embedded Python 3.8.20), minichlink, and
   `riscv-wch-elf-gdb`; not every GEF command has been validated on hardware.
 - Upstream GEF is not responsible for these changes. Report fork-specific
