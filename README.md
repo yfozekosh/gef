@@ -110,7 +110,7 @@ After GEF loads, `gef` becomes GEF's own help command. Use a separate command
 if you need to re-apply the companion without reloading GEF:
 
 ```gdb
-define gef-riscv
+define chef
     python import os, runpy, __main__; hasattr(__main__, "gef") and runpy.run_path(os.path.expanduser("~/Projects/gef/gef_riscv.py"))
 end
 ```
