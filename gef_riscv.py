@@ -411,9 +411,11 @@ if getattr(gef.arch, "arch", "") == "RISCV":
         pass
 
     # RV32E has a0-a5 only; GEF's RISC-V class assumes the full a0-a7 ABI.
+    # There is also no syscall ABI (and no $a7) on the bare-metal target.
     try:
         type(gef.arch).function_parameters = ("$a0", "$a1", "$a2",
                                               "$a3", "$a4", "$a5")
+        type(gef.arch).syscall_register = ""
     except Exception:
         pass
 
