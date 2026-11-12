@@ -1,3 +1,122 @@
+# GEF fork for WCH CH32V003 (RV32EC)
+
+> Personal, experimental fork of [hugsy/gef](https://github.com/hugsy/gef),
+> pinned to upstream tag [`2024.06`](https://github.com/hugsy/gef/tree/2024.06).
+> It is not affiliated with, or supported by, upstream GEF.
+
+## Why this fork exists
+
+This fork exists to debug the **WCH CH32V003** (QingKe V2, RV32EC) over the
+GDB stub in [minichlink](https://github.com/cnlohr/ch32fun), using the WCH
+`riscv-wch-elf-gdb` toolchain.
+
+Stock GEF does not work well in that environment:
+
+1. **Python version.** The WCH toolchain embeds Python 3.8. GEF 2025.01 and
+   later require Python 3.10, so this fork stays on the 2024.06 code base.
+2. **No OS memory map.** GEF's `registers`, `dereference` and `stack` view need
+   a memory layout. On the MCU there is no `/proc`, `info proc mappings` fails,
+   and minichlink does not implement `monitor info mem`.
+3. **RV32E registers.** GEF advertises the full RV32I register file
+   (`$a6`, `$a7`, `$s2`...), but the CH32V003 only has 16 registers.
+4. **Compressed instructions.** GEF assumes fixed 4-byte RISC-V instructions
+   and computes "N instructions before PC" as `pc - 4*N`. That skips 2-byte
+   C-extension instructions and makes the code pane drift while single-stepping.
+5. **Source colours.** GEF renders its source pane itself, so GDB's Pygments
+   source styling does not apply there.
+
+Most changes live in **`gef_riscv.py`**, a companion loaded after `gef.py`.
+Keeping them outside `gef.py` makes it easier to rebase on upstream. A few
+small, self-contained fixes are backported directly into `gef.py`:
+
+- RISC-V `bge`/`bgeu` taken-condition fix.
+- `TIOCGWINSZ` 8-byte buffer fix.
+- `Section.is_readable/is_writable/is_executable` truthiness fix.
+- Cap on the distance searched when `context` guesses function arguments.
+
+## What `gef_riscv.py` adds
+
+- A bare-metal memory map derived from the loaded ELF:
+  - `0x00000000-0x00004000` flash, `r-x`
+  - `0x20000000-0x20000800` SRAM, `rw-`
+  - `0x40000000-0x40030000` APB peripherals, `rw-`
+  - `0xE0000000-0xE0001000` core peripherals, `rw-`
+- Filtering of GEF's register list to the 16 real RV32E registers.
+- Variable-length instruction lookup, so 2-byte and 4-byte instructions are
+  both handled correctly in the code pane.
+- Unsigned decimal values alongside the hex in `registers` and the context view.
+- Pygments/GAS syntax colouring for the source pane.
+- An embedded context profile: `regs stack code source`, stack growing down,
+  no screen clear, and no source-variable values.
+
+The profile is applied every time the companion loads. Override any setting
+afterwards if you want the full layout back, for example:
+
+```gdb
+gef config context.layout "legend regs stack code args source memory threads trace extra"
+```
+
+## Usage
+
+Clone this branch:
+
+```bash
+git clone --branch ch32v003-rv32ec https://github.com/yfozekosh/gef.git
+```
+
+Load GEF, then the companion:
+
+```gdb
+python import os; os.environ.pop("PYTHONHOME", None)
+source ~/Projects/gef/gef.py
+python import os, runpy; runpy.run_path(os.path.expanduser("~/Projects/gef/gef_riscv.py"))
+```
+
+`PYTHONHOME` is removed because the WCH GDB exports its embedded Python home;
+GEF's internal `python3` probe fails if it inherits that value.
+
+To make this repeatable, add a command such as:
+
+```gdb
+define gef
+    python import os; os.environ.pop("PYTHONHOME", None)
+    source ~/Projects/gef/gef.py
+    python import os, runpy; runpy.run_path(os.path.expanduser("~/Projects/gef/gef_riscv.py"))
+end
+
+document gef
+    Load GEF and the CH32V003/RV32EC companion.
+end
+```
+
+After GEF loads, `gef` becomes GEF's own help command. Use a separate command
+if you need to re-apply the companion without reloading GEF:
+
+```gdb
+define gef-riscv
+    python import os, runpy; runpy.run_path(os.path.expanduser("~/Projects/gef/gef_riscv.py"))
+end
+```
+
+## Scope and limitations
+
+- The memory map is sized for the **CH32V003F4P6**: 16 KiB flash, 2 KiB SRAM.
+  Adjust the constants at the top of `gef_riscv.py` for another part.
+- GEF's Linux-userland commands (`vmmap`, `heap`, and similar) are not useful
+  on a bare-metal target.
+- Tested with WCH GDB 17.1 (embedded Python 3.8.20), minichlink, and
+  `riscv-wch-elf-gdb`; not every GEF command has been validated on hardware.
+- Upstream GEF is not responsible for these changes. Report fork-specific
+  issues at <https://github.com/yfozekosh/gef/issues>.
+
+## License
+
+MIT, inherited from GEF. See [`LICENSE`](LICENSE).
+
+---
+
+The upstream GEF README follows unchanged.
+
 <p align="center">
   <img src="https://i.imgur.com/o0L8lPN.png" alt="logo"/>
 </p>

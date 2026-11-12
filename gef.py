@@ -675,13 +675,13 @@ class Section:
         return
 
     def is_readable(self) -> bool:
-        return (self.permission & Permission.READ) != 0
+        return bool(self.permission & Permission.READ)
 
     def is_writable(self) -> bool:
-        return (self.permission & Permission.WRITE) != 0
+        return bool(self.permission & Permission.WRITE)
 
     def is_executable(self) -> bool:
-        return (self.permission & Permission.EXECUTE) != 0
+        return bool(self.permission & Permission.EXECUTE)
 
     @property
     def size(self) -> int:
@@ -2556,7 +2556,7 @@ class RISCV(Architecture):
             if rs1 <= rs2: taken, reason = True, f"{rs1}<={rs2}"
             else: taken, reason = False, f"{rs1}>{rs2}"
         elif condition == "ge":
-            if rs1 < rs2: taken, reason = True, f"{rs1}>={rs2}"
+            if rs1 >= rs2: taken, reason = True, f"{rs1}>={rs2}"
             else: taken, reason = False, f"{rs1}<{rs2}"
         else:
             raise OSError(f"RISC-V: Conditional instruction `{insn}` not supported yet")
@@ -3735,7 +3735,7 @@ def get_terminal_size() -> Tuple[int, int]:
         import fcntl
         import termios
         try:
-            tty_rows, tty_columns = struct.unpack("hh", fcntl.ioctl(1, termios.TIOCGWINSZ, "1234")) # type: ignore
+            tty_rows, tty_columns, _, _ = struct.unpack("hhhh", fcntl.ioctl(1, termios.TIOCGWINSZ, "12345678")) # type: ignore
             return tty_rows, tty_columns
         except OSError:
             return 600, 100
@@ -7908,19 +7908,22 @@ class ContextCommand(GenericCommand):
 
         def __get_current_block_start_address() -> Optional[int]:
             pc = gef.arch.pc
+            max_distance = 10 * 16
             try:
                 block = gdb.block_for_pc(pc)
-                block_start = block.start if block else gdb_get_nth_previous_instruction_address(pc, 5)
+                block_start = block.start \
+                    if block is not None and (pc - block.start) <= max_distance \
+                    else gdb_get_nth_previous_instruction_address(pc, 5)
             except RuntimeError:
                 block_start = gdb_get_nth_previous_instruction_address(pc, 5)
             return block_start
 
-        parameter_set = set()
-        pc = gef.arch.pc
         block_start = __get_current_block_start_address()
         if not block_start:
             return
 
+        parameter_set = set()
+        pc = gef.arch.pc
         function_parameters = gef.arch.function_parameters
         arg_key_color = gef.config["theme.registers_register_name"]
 
