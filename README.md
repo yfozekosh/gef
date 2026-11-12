@@ -40,12 +40,18 @@ small, self-contained fixes are backported directly into `gef.py`:
   - `0x00000000-0x00004000` flash, `r-x`
   - `0x20000000-0x20000800` SRAM, `rw-`
   - `0x40000000-0x40030000` APB peripherals, `rw-`
-  - `0xE0000000-0xE0001000` core peripherals, `rw-`
-- Filtering of GEF's register list to the 16 real RV32E registers.
+  - `0xE0000000-0xE0010000` core peripherals, `rw-` (PFIC at `0xE000E000`,
+    SysTick at `0xE000F000`)
+- Filtering of GEF's register list to the 16 real RV32E registers, and of
+  `function_parameters` to `a0-a5`.
 - Variable-length instruction lookup, so 2-byte and 4-byte instructions are
-  both handled correctly in the code pane.
+  both handled correctly in the code pane, including the reset vector at
+  address 0.
+- Missing RISC-V branch conditions (`bgt`, `bgtu`, `bgtz`), which otherwise
+  abort the whole `context` command in delay loops.
 - Unsigned decimal values alongside the hex in `registers` and the context view.
-- Pygments/GAS syntax colouring for the source pane.
+- Pygments syntax colouring for the source pane (GAS for assembly, C for C
+  sources).
 - An embedded context profile: `regs stack code source`, stack growing down,
   no screen clear, and no source-variable values.
 

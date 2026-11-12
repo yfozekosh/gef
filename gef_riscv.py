@@ -50,7 +50,9 @@ RAM_START = 0x20000000
 RAM_END = 0x20000800
 PERIPH_RANGES = (
     (0x40000000, 0x40030000),  # APB1/APB2 (GPIO, USART, SPI, I2C, RCC, ...)
-    (0xE0000000, 0xE0001000),  # core peripherals (SysTick is at 0xE000F000)
+    # PFIC is at 0xE000E000 and SysTick at 0xE000F000, both outside the
+    # first 4 KiB of the core-peripheral window.
+    (0xE0000000, 0xE0010000),
 )
 
 # Bare-metal context profile. GEF's defaults include panes that need a
@@ -72,7 +74,7 @@ Pygments = None
 try:
     from pygments import highlight as _pygments_highlight
     from pygments.formatters import Terminal256Formatter
-    from pygments.lexers import GasLexer
+    from pygments.lexers import CLexer, GasLexer
 
     Pygments = True
 except Exception:
@@ -176,7 +178,7 @@ if getattr(gef.arch, "arch", "") == "RISCV":
             for reg in gef.arch.all_registers:
                 try:
                     value = gdb.parse_and_eval(reg)
-                except gdb.error:
+                except Exception:
                     continue
                 if value.type.code != gdb.TYPE_CODE_VOID:
                     present.append(reg)
@@ -207,7 +209,11 @@ if getattr(gef.arch, "arch", "") == "RISCV":
         if gef.arch.instruction_length:
             return max(0, addr - n * gef.arch.instruction_length)
 
-        cur_insn_addr = _main.gef_current_instruction(addr).address
+        try:
+            cur_insn_addr = _main.gef_current_instruction(addr).address
+        except (gdb.error, OverflowError):
+            return None
+
         for i in range(15 * n, 0, -1):
             start_addr = addr - i
             if start_addr < 0:
@@ -215,7 +221,9 @@ if getattr(gef.arch, "arch", "") == "RISCV":
             try:
                 insns = list(_main.gdb_disassemble(start_addr, end_pc=cur_insn_addr))
             except (gdb.error, OverflowError):
-                break
+                # The far end of the window can start before flash; try a
+                # closer start address instead of giving up on the pane.
+                continue
 
             if len(insns) < n + 1:
                 continue
@@ -230,6 +238,106 @@ if getattr(gef.arch, "arch", "") == "RISCV":
 
     try:
         _main.gdb_get_nth_previous_instruction_address = _safe_previous_instruction_address
+    except Exception:
+        pass
+
+    # GEF 2024.06 knows eq/ne/lt/le/ge but not `gt`, so `context` aborts on
+    # `bgt`/`bgtu`/`bgtz`, which the delay loops in this firmware use. Also
+    # normalise the `c.` prefix used by compressed branch mnemonics.
+    def _riscv_is_conditional_branch(self, insn):
+        mnemo = insn.mnemonic
+        if mnemo.startswith("c."):
+            mnemo = mnemo[2:]
+        return mnemo.startswith("b")
+
+    def _riscv_is_branch_taken(self, insn):
+        mnemo = insn.mnemonic
+        if mnemo.startswith("c."):
+            mnemo = mnemo[2:]
+        condition = mnemo[1:]
+
+        def to_signed(value):
+            bits = gef.arch.ptrsize * 8
+            if bits == 32 and value & 0x80000000:
+                return value - 0x100000000
+            if bits == 64 and value & 0x8000000000000000:
+                return value - 0x10000000000000000
+            return value
+
+        if condition.endswith("z"):
+            rs1 = self.register(insn.operands[0])
+            rs2 = self.register("$zero")
+            condition = condition[:-1]
+        elif len(insn.operands) > 2:
+            rs1 = self.register(insn.operands[0])
+            rs2 = self.register(insn.operands[1])
+        else:
+            raise OSError(f"RISC-V: Failed to get rs1 and rs2 for instruction: `{insn}`")
+
+        if condition.endswith("u"):
+            condition = condition[:-1]
+        else:
+            rs1 = to_signed(rs1)
+            rs2 = to_signed(rs2)
+
+        if condition == "eq":
+            taken = rs1 == rs2
+            reason = f"{rs1}={rs2}" if taken else f"{rs1}!={rs2}"
+        elif condition == "ne":
+            taken = rs1 != rs2
+            reason = f"{rs1}!={rs2}" if taken else f"{rs1}={rs2}"
+        elif condition == "lt":
+            taken = rs1 < rs2
+            reason = f"{rs1}<{rs2}" if taken else f"{rs1}>={rs2}"
+        elif condition == "le":
+            taken = rs1 <= rs2
+            reason = f"{rs1}<={rs2}" if taken else f"{rs1}>{rs2}"
+        elif condition == "gt":
+            taken = rs1 > rs2
+            reason = f"{rs1}>{rs2}" if taken else f"{rs1}<={rs2}"
+        elif condition == "ge":
+            taken = rs1 >= rs2
+            reason = f"{rs1}>={rs2}" if taken else f"{rs1}<{rs2}"
+        else:
+            raise OSError(f"RISC-V: Conditional instruction `{insn}` not supported yet")
+
+        return taken, reason
+
+    try:
+        type(gef.arch).is_conditional_branch = _riscv_is_conditional_branch
+        type(gef.arch).is_branch_taken = _riscv_is_branch_taken
+    except Exception:
+        pass
+
+    # libopcodes can produce a valid previous instruction at address 0. GEF's
+    # `if start_addr:` treats that as "no result", so a PC at 0x4 loses the
+    # reset-vector instruction. Reimplement the generator with a None check.
+    def _safe_gef_disassemble(addr, nb_insn, nb_prev=0):
+        nb_insn = max(1, nb_insn)
+
+        if nb_prev:
+            try:
+                start_addr = _main.gdb_get_nth_previous_instruction_address(addr, nb_prev)
+                if start_addr is not None:
+                    for insn in _main.gdb_disassemble(start_addr, count=nb_prev):
+                        if insn.address == addr:
+                            break
+                        yield insn
+            except (gdb.error, OverflowError):
+                pass
+
+        for insn in _main.gdb_disassemble(addr, count=nb_insn):
+            yield insn
+
+    try:
+        _main.gef_disassemble = _safe_gef_disassemble
+    except Exception:
+        pass
+
+    # RV32E has a0-a5 only; GEF's RISC-V class assumes the full a0-a7 ABI.
+    try:
+        type(gef.arch).function_parameters = ("$a0", "$a1", "$a2",
+                                              "$a3", "$a4", "$a5")
     except Exception:
         pass
 
@@ -260,7 +368,10 @@ def _registers_do_invoke(self, _argv, **kwargs):
     special_line = ""
 
     for regname in regs:
-        reg = gdb.parse_and_eval(regname)
+        try:
+            reg = gdb.parse_and_eval(regname)
+        except Exception:
+            continue
         if reg.type.code == gdb.TYPE_CODE_VOID:
             continue
 
@@ -342,9 +453,10 @@ def _highlight_source(path, lines):
         return cached
 
     try:
+        lexer = CLexer() if path.endswith((".c", ".h", ".cc", ".cpp", ".hpp")) else GasLexer()
         text = "\n".join(lines)
         coloured = _pygments_highlight(
-            text, GasLexer(), Terminal256Formatter(style="monokai")
+            text, lexer, Terminal256Formatter(style="monokai")
         )
         result = coloured.splitlines()
         if len(result) < len(lines):
@@ -401,7 +513,7 @@ def context_source(self):
     show_extra_info = self["show_source_code_variable_values"]
 
     for i in range(line_num - nb_line + 1, line_num + nb_line):
-        if i < 0:
+        if i < 0 or i >= len(shown):
             continue
 
         bp_prefix = (Color.redify(BP_GLYPH)
@@ -441,6 +553,8 @@ try:
     _context = gef.gdb.commands.get("context")
     if _context is not None:
         _context.layout_mapping["source"] = (_context.context_source, None, None)
+        # __init__ captured the original generator, not a name lookup.
+        _context.instruction_iterator = _main.gef_disassemble
 except Exception:
     pass
 
