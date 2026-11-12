@@ -38,10 +38,14 @@ small, self-contained fixes are backported directly into `gef.py`:
 
 - A bare-metal memory map derived from the loaded ELF:
   - `0x00000000-0x00004000` flash, `r-x`
-  - `0x20000000-0x20000800` SRAM, `rw-`
+  - `0x08000000-0x08004000` flash read alias, `r--`
+  - `0x20000000-0x20000804` SRAM, `rw-` (the last word past `_stack_top` lets
+    GEF classify the initial `$sp`)
   - `0x40000000-0x40030000` APB peripherals, `rw-`
   - `0xE0000000-0xE0010000` core peripherals, `rw-` (PFIC at `0xE000E000`,
     SysTick at `0xE000F000`)
+  - `0x1FFFF704-0x1FFFF708`, `0x1FFFF7E0-0x1FFFF7F4` and
+    `0x1FFFF800-0x1FFFF80C` read-only INFO/ESIG/option-byte windows
 - Filtering of GEF's register list to the 16 real RV32E registers, and of
   `function_parameters` to `a0-a5`.
 - Variable-length instruction lookup, so 2-byte and 4-byte instructions are
@@ -49,6 +53,13 @@ small, self-contained fixes are backported directly into `gef.py`:
   address 0.
 - Missing RISC-V branch conditions (`bgt`, `bgtu`, `bgtz`), which otherwise
   abort the whole `context` command in delay loops.
+- RISC-V call/return detection for the real `jal`/`jalr` mnemonics and the
+  compressed `c.jal`/`c.jalr`/`c.jr` forms (GEF only knew `call`, and treated
+  `c.jalr` as a return).
+- A stack pane that reads the window ending at `$sp` when
+  `context.grow_stack_down` is set. GEF's default reads upward from `$sp`,
+  which is outside SRAM at reset.
+- The original `(gdb) [MCU:3333]` prompt, instead of GEF's `(remote) gef➤`.
 - Unsigned decimal values alongside the hex in `registers` and the context view.
 - Pygments syntax colouring for the source pane (GAS for assembly, C for C
   sources).
@@ -100,9 +111,14 @@ if you need to re-apply the companion without reloading GEF:
 
 ```gdb
 define gef-riscv
-    python import os, runpy; runpy.run_path(os.path.expanduser("~/Projects/gef/gef_riscv.py"))
+    python import os, runpy, __main__; hasattr(__main__, "gef") and runpy.run_path(os.path.expanduser("~/Projects/gef/gef_riscv.py"))
 end
 ```
+
+The Python guard makes the command a no-op when GEF is not loaded. That is
+useful for calling it from a `reload` command after `load`, so the memory map
+is rebuilt from the newly flashed ELF even in sessions where GEF was never
+loaded.
 
 ## Scope and limitations
 

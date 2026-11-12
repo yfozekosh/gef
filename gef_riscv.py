@@ -46,6 +46,8 @@ err = _main.err
 # CH32V003F4P6: 16 KiB flash, 2 KiB SRAM, plus the peripheral windows.
 FLASH_START = 0x00000000
 FLASH_END = 0x00004000
+FLASH_ALIAS_START = 0x08000000
+FLASH_ALIAS_END = 0x08004000
 RAM_START = 0x20000000
 RAM_END = 0x20000800
 PERIPH_RANGES = (
@@ -53,6 +55,13 @@ PERIPH_RANGES = (
     # PFIC is at 0xE000E000 and SysTick at 0xE000F000, both outside the
     # first 4 KiB of the core-peripheral window.
     (0xE0000000, 0xE0010000),
+)
+# Read-only system-information windows. These are not part of the ELF, but
+# ch32fun exposes them through INFO/ESIG/OB and GDB can read them over SWIO.
+INFO_RANGES = (
+    (0x1FFFF704, 0x1FFFF708),  # INFO (chip ID)
+    (0x1FFFF7E0, 0x1FFFF7F4),  # ESIG (flash capacity and unique ID)
+    (0x1FFFF800, 0x1FFFF80C),  # option bytes
 )
 
 # Bare-metal context profile. GEF's defaults include panes that need a
@@ -158,10 +167,19 @@ def _riscv_maps():
                             permission=Permission.READ | Permission.EXECUTE,
                             path=""))
 
+    # The 0x08000000 window is the read alias of the same 16 KiB flash.
+    sections.append(Section(page_start=FLASH_ALIAS_START,
+                            page_end=FLASH_ALIAS_END,
+                            permission=Permission.READ, path=""))
+
     for start, end in PERIPH_RANGES:
         sections.append(Section(page_start=start, page_end=end,
                                 permission=Permission.READ | Permission.WRITE,
                                 path=""))
+
+    for start, end in INFO_RANGES:
+        sections.append(Section(page_start=start, page_end=end,
+                                permission=Permission.READ, path=""))
 
     return iter(_merge_sections(sections))
 
@@ -303,9 +321,67 @@ if getattr(gef.arch, "arch", "") == "RISCV":
 
         return taken, reason
 
+    # GEF's RISCV layer only recognises the `call` pseudo-instruction, but
+    # GDB prints the real mnemonics (`jal`/`jalr`, and the compressed
+    # `c.jal`/`c.jalr`). It also treats `c.jalr` as a return, although it is a
+    # call; the return form is `c.jr ra`. Both matter to the code pane's
+    # call/return peek and to the `args` pane.
+    def _riscv_ops(insn):
+        return [op.strip() for op in insn.operands]
+
+    def _riscv_is_call(self, insn):
+        mnemo = insn.mnemonic.lower()
+        ops = _riscv_ops(insn)
+
+        if mnemo in ("call", "c.jal", "c.jalr"):
+            return True
+
+        if mnemo == "jal":
+            # `jal offset` has an implicit rd=ra; `jal rd, offset` names it.
+            if not ops:
+                return True
+            if len(ops) == 1:
+                return ops[0] not in ("ra", "x1", "zero", "x0")
+            return ops[0] in ("ra", "x1")
+
+        if mnemo == "jalr":
+            # `jalr rs1` is the pseudo-form with rd=ra.
+            if not ops:
+                return False
+            if len(ops) == 1:
+                return ops[0] not in ("zero", "x0")
+            return ops[0] in ("ra", "x1")
+
+        return False
+
+    def _riscv_is_ret(self, insn):
+        mnemo = insn.mnemonic.lower()
+        ops = _riscv_ops(insn)
+
+        if mnemo == "ret":
+            return True
+        if mnemo == "c.jr":
+            return bool(ops) and ops[0] in ("ra", "x1")
+        if mnemo != "jalr":
+            return False
+        if not ops or ops[0] not in ("zero", "x0"):
+            return False
+
+        rest = ops[1:]
+        if not rest:
+            return False
+        if len(rest) == 1:
+            # `jalr zero, 0(ra)` / `jalr zero, (ra)` / `jalr zero, ra`.
+            return (rest[0] in ("ra", "x1")
+                    or re.match(r"^(?:0x0|0)?\((?:ra|x1)\)$", rest[0]) is not None)
+        # Three-operand form: `jalr zero, ra, 0`.
+        return rest[0] in ("ra", "x1") and rest[1] in ("0", "0x0")
+
     try:
         type(gef.arch).is_conditional_branch = _riscv_is_conditional_branch
         type(gef.arch).is_branch_taken = _riscv_is_branch_taken
+        type(gef.arch).is_call = _riscv_is_call
+        type(gef.arch).is_ret = _riscv_is_ret
     except Exception:
         pass
 
@@ -340,6 +416,19 @@ if getattr(gef.arch, "arch", "") == "RISCV":
                                               "$a3", "$a4", "$a5")
     except Exception:
         pass
+
+
+# --- prompt --------------------------------------------------------------
+# GEF installs its own prompt hook. Keep the MCU/port indicator that the
+# project's .gdbinit used instead of replacing it with `(remote) gef➤`.
+def _mcu_prompt(_current_prompt):
+    return "(gdb) \001\033[1;36m\002[MCU:3333]\001\033[0m\002 "
+
+
+try:
+    gdb.prompt_hook = _mcu_prompt
+except Exception:
+    pass
 
 
 # --- registers: hex plus decimal -----------------------------------------
@@ -555,6 +644,84 @@ try:
         _context.layout_mapping["source"] = (_context.context_source, None, None)
         # __init__ captured the original generator, not a name lookup.
         _context.instruction_iterator = _main.gef_disassemble
+except Exception:
+    pass
+
+
+# --- arguments pane ------------------------------------------------------
+# GEF's `context_args` was written for x86: for `jal ra, func` it treats the
+# first operand as a pointer register and dereferences the *current* `$ra`,
+# not the call target. Resolve the target from the disassembly instead, and
+# only show arguments when DWARF provides them (there is no x86-style
+# instruction guessing to do on RISC-V).
+def context_args(self):
+    try:
+        insn = _main.gef_current_instruction(gef.arch.pc)
+    except (gdb.error, OverflowError):
+        return
+    if not gef.arch.is_call(insn):
+        return
+
+    ops = " ".join(insn.operands)
+    match = re.search(r"<([^>]+)>", ops)
+    if match is None:
+        return
+
+    target = match.group(1)
+    try:
+        sym = gdb.lookup_global_symbol(target)
+    except gdb.error:
+        return
+    if sym is None or sym.type is None or sym.type.code != gdb.TYPE_CODE_FUNC:
+        return
+
+    self.print_arguments_from_symbol(target, sym)
+    return
+
+
+ContextCommand.context_args = context_args
+
+try:
+    _context = gef.gdb.commands.get("context")
+    if _context is not None:
+        _context.layout_mapping["args"] = (_context.context_args, None, None)
+except Exception:
+    pass
+
+
+# --- stack pane ----------------------------------------------------------
+# GEF always dereferences upward from $sp. On a downward-growing stack the
+# interesting words are below $sp, and at reset $sp is the very top of SRAM,
+# so the default pane reads unmapped memory above the stack. Read the window
+# ending at $sp instead when `context.grow_stack_down` is set.
+def context_stack(self):
+    self.context_title("stack")
+
+    show_raw = self["show_stack_raw"]
+    nb_lines = self["nb_lines_stack"]
+
+    try:
+        sp = gef.arch.sp
+        if show_raw is True:
+            size = 0x10 * nb_lines
+            start = sp - size if self["grow_stack_down"] else sp
+            mem = gef.memory.read(start, size)
+            gef_print(_main.hexdump(mem, base=start))
+        else:
+            start = (sp - nb_lines * gef.arch.ptrsize
+                     if self["grow_stack_down"] else sp)
+            gdb.execute(f"dereference -l {nb_lines:d} {start:#x}")
+    except (gdb.MemoryError, gdb.error):
+        err("Cannot read memory from $SP (corrupted stack pointer?)")
+    return
+
+
+ContextCommand.context_stack = context_stack
+
+try:
+    _context = gef.gdb.commands.get("context")
+    if _context is not None:
+        _context.layout_mapping["stack"] = (_context.context_stack, None, None)
 except Exception:
     pass
 
