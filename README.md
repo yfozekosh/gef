@@ -106,19 +106,30 @@ document gef
 end
 ```
 
-After GEF loads, `gef` becomes GEF's own help command. Use a separate command
-if you need to re-apply the companion without reloading GEF:
+After GEF loads, `gef` becomes GEF's own help command. Use `chef` to enter
+the environment in one step. It loads GEF when necessary, then applies the
+companion patch; calling it again only re-applies the patch:
 
 ```gdb
 define chef
-    python import os, runpy, __main__; hasattr(__main__, "gef") and runpy.run_path(os.path.expanduser("~/Projects/gef/gef_riscv.py"))
+    python
+import os, runpy, __main__
+if not hasattr(__main__, "gef"):
+    os.environ.pop("PYTHONHOME", None)
+    gdb.execute("source ~/Projects/gef/gef.py")
+runpy.run_path(os.path.expanduser("~/Projects/gef/gef_riscv.py"))
+end
+end
+
+document chef
+    Load GEF if needed, then apply the CH32V003/RV32EC companion.
 end
 ```
 
-The Python guard makes the command a no-op when GEF is not loaded. That is
-useful for calling it from a `reload` command after `load`, so the memory map
-is rebuilt from the newly flashed ELF even in sessions where GEF was never
-loaded.
+`reload` only needs to re-apply the patch when GEF is already loaded, so guard
+that call with `hasattr(__main__, "gef")`. This keeps a plain GDB session
+plain while still rebuilding the memory map from the freshly flashed ELF in a
+GEF session.
 
 ## Scope and limitations
 
