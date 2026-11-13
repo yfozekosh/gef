@@ -184,9 +184,33 @@ def _riscv_maps():
     return iter(_merge_sections(sections))
 
 
+def _read_cstring(self, address, max_length=None, encoding=None):
+    """Clamp GEF's string read to the memory section containing `address`.
+
+    `read_cstring` asks for up to 51 bytes starting at the pointer. At the
+    top of SRAM that crosses the end of the section, and the whole read fails
+    with "Can't read memory at ..." even though the first bytes are valid.
+    This is common in the stack pane, where uninitialised words often point
+    just below `_stack_top`.
+    """
+    if max_length is None:
+        max_length = _main.GEF_MAX_STRING_LENGTH
+    try:
+        section = next((s for s in gef.memory.maps
+                        if s.page_start <= address < s.page_end), None)
+    except Exception:
+        section = None
+    if section is not None:
+        max_length = min(max_length, max(0, section.page_end - address - 1))
+    return _orig_read_cstring(self, address, max_length, encoding)
+
+
+_orig_read_cstring = type(gef.memory).read_cstring
+
 if getattr(gef.arch, "arch", "") == "RISCV":
     gef.arch.maps = _riscv_maps
     gef.memory.reset_caches()
+    type(gef.memory).read_cstring = _read_cstring
 
     # minichlink exposes only the 16 RV32E registers. If a target is already
     # attached, keep exactly the ones that exist; otherwise assume RV32EC.
